@@ -13,7 +13,7 @@ import huggingface_hub.constants
 from tqdm.asyncio import tqdm
 from transformers import (AutoTokenizer, PreTrainedTokenizer,
                           PreTrainedTokenizerFast)
-
+import base64
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
@@ -51,8 +51,7 @@ async def async_request_tgi(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("generate_stream")
-
+    #assert api_url.endswith("generate_stream")
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
         params = {
@@ -61,9 +60,20 @@ async def async_request_tgi(
             "do_sample": True,
             "temperature": 0.01,  # TGI does not accept 0.0 temperature.
             "top_p": 0.99,  # TGI does not accept 1.0 top_p.
-            "truncate": request_func_input.prompt_len,
+            # "truncate": request_func_input.prompt_len,
             # TGI does not accept ignore_eos flag.
         }
+        if request_func_input.multi_modal_content is not None :
+            image_path = str(request_func_input.multi_modal_content["image_url"]["url"])
+            image_path = image_path.split("file://")[1]
+            print(f"""image_path: {image_path}""")
+            
+            with open(image_path, "rb") as f:
+                image = base64.b64encode(f.read()).decode("utf-8")
+
+            image = f"data:image/jpeg;base64,{image}"
+            prompt = request_func_input.prompt
+            request_func_input.prompt = f"![]({image}){prompt}\n\n"
         payload = {
             "inputs": request_func_input.prompt,
             "parameters": params,
@@ -76,13 +86,14 @@ async def async_request_tgi(
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
+                print(f"response: {response}")
                 if response.status == 200:
+                    print(f"response: {response}")
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
                         chunk_bytes = chunk_bytes.decode("utf-8")
-
                         # NOTE: Sometimes TGI returns a ping response without
                         # any data, we should skip it.
                         if chunk_bytes.startswith(":"):
@@ -90,6 +101,7 @@ async def async_request_tgi(
                         chunk = chunk_bytes.removeprefix("data:")
 
                         data = json.loads(chunk)
+                        output.generated_text += data["token"]["text"]
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
@@ -105,7 +117,8 @@ async def async_request_tgi(
 
                     output.latency = most_recent_timestamp - st
                     output.success = True
-                    output.generated_text = data["generated_text"]
+                    output.generated_text = output.generated_text.strip()
+                    print(f"""output.generated_text: {output.generated_text}""")
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -147,17 +160,18 @@ async def async_request_trt_llm(
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
+                print(f"""response: {response}""")
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
+                    print(f"""response: {response}""")
+                    async for chunk_bytes in response.iter_content():
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data:")
-
-                        data = json.loads(chunk)
-                        output.generated_text += data["text_output"]
+                        chunk = chunk_bytes.decode("utf-8")
+                        print(f"chunk: {chunk}")
+                        #data = json.loads(chunk)
+                        output.generated_text += chunk
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
@@ -170,7 +184,7 @@ async def async_request_trt_llm(
                                               most_recent_timestamp)
 
                         most_recent_timestamp = timestamp
-
+                    print(f"output.generated_text: {output.generated_text}")
                     output.latency = most_recent_timestamp - st
                     output.success = True
 

@@ -37,7 +37,7 @@ class RequestFuncOutput:
     generated_text: str = ""
     success: bool = False
     latency: float = 0.0
-    output_tokens: int = 0
+    output_tokens: int = None
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(
         default_factory=list)  # List of inter-token latencies
@@ -86,9 +86,7 @@ async def async_request_tgi(
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
-                print(f"response: {response}")
                 if response.status == 200:
-                    print(f"response: {response}")
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -118,7 +116,7 @@ async def async_request_tgi(
                     output.latency = most_recent_timestamp - st
                     output.success = True
                     output.generated_text = output.generated_text.strip()
-                    print(f"""output.generated_text: {output.generated_text}""")
+                    #print(f"""ogenerated_text: {output.generated_text}""")
                 else:
                     output.error = response.reason or ""
                     output.success = False

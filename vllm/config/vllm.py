@@ -58,6 +58,7 @@ from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
+from .unified_cache import UnifiedCacheConfig
 from .utils import (
     CompileFactors,
     SupportsCompileFactors,
@@ -517,6 +518,8 @@ class VllmConfig:
     """The configurations for custom encoder cache manager."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
+    unified_cache_config: UnifiedCacheConfig | None = None
+    """Configuration for the unified KV + Expert cache system."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.

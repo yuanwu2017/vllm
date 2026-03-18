@@ -45,6 +45,7 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
 from vllm.config.structured_outputs import StructuredOutputsConfig
+from vllm.config.unified_cache import UnifiedCacheConfig
 from vllm.config.utils import (
     ConfigType,
     SupportsMetricsInfo,
@@ -135,6 +136,8 @@ __all__ = [
     "SpeechToTextParams",
     # From vllm.config.structured_outputs
     "StructuredOutputsConfig",
+    # From vllm.config.unified_cache
+    "UnifiedCacheConfig",
     # From vllm.config.profiler
     "ProfilerConfig",
     # From vllm.config.fault_tolerance

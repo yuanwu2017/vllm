@@ -682,6 +682,10 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            from vllm.unified_cache.moe_integration import unified_cache_pre_forward
+
+            unified_cache_pre_forward(self.layer_name, topk_ids)
+
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,

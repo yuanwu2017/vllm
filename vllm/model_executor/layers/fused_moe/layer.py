@@ -1689,6 +1689,13 @@ class FusedMoE(CustomOp):
                 if self.capture is not None:
                     self.capture(topk_ids)
 
+                # Unified cache hook: track activations and ensure expert
+                # weights are loaded on GPU before MoE computation.
+                from vllm.unified_cache.moe_integration import (
+                    unified_cache_pre_forward,
+                )
+                unified_cache_pre_forward(self.layer_name, topk_ids)
+
                 final_hidden_states = self.quant_method.apply(
                     layer=self,
                     x=staged_hidden_states,
@@ -1881,6 +1888,13 @@ class FusedMoE(CustomOp):
 
                 if self.capture is not None:
                     self.capture(topk_ids)
+
+                # Unified cache hook: track activations and ensure expert
+                # weights are loaded on GPU before MoE computation.
+                from vllm.unified_cache.moe_integration import (
+                    unified_cache_pre_forward,
+                )
+                unified_cache_pre_forward(self.layer_name, topk_ids)
 
                 final_hidden_states = self.quant_method.apply(
                     layer=self,

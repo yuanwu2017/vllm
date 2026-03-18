@@ -111,8 +111,11 @@ class ExpertCacheEngine:
         self._gpu_memory_used: int = 0
         self._cpu_memory_used: int = 0
 
-        # Dedicated CUDA stream for async transfers
-        self._transfer_stream = torch.cuda.Stream(device=device)
+        # Dedicated CUDA stream for async transfers (only on CUDA devices)
+        self._is_cuda = device.type == "cuda"
+        self._transfer_stream = (
+            torch.cuda.Stream(device=device) if self._is_cuda else None
+        )
 
         # Statistics
         self.stats = ExpertCacheStats()
@@ -244,15 +247,15 @@ class ExpertCacheEngine:
 
         elif entry.location == ExpertLocation.LOADING:
             # Transfer in progress — wait for completion
-            if entry.transfer_event is not None:
+            if entry.transfer_event is not None and self._is_cuda:
                 entry.transfer_event.synchronize()
-                entry.location = ExpertLocation.GPU
-                entry.transfer_event = None
-                entry.access_count += 1
-                entry.last_access_time = now
-                self._gpu_lru[key] = None
-                self.stats.cache_hits += 1
-                return entry.gpu_tensors
+            entry.location = ExpertLocation.GPU
+            entry.transfer_event = None
+            entry.access_count += 1
+            entry.last_access_time = now
+            self._gpu_lru[key] = None
+            self.stats.cache_hits += 1
+            return entry.gpu_tensors
 
         # Cache miss
         self.stats.cache_misses += 1
@@ -308,38 +311,46 @@ class ExpertCacheEngine:
                 )
                 return None
 
-        # Async transfer CPU→GPU
+        # Transfer CPU→GPU (async on CUDA, sync on CPU)
         load_start = time.monotonic()
         entry.location = ExpertLocation.LOADING
 
-        with torch.cuda.stream(self._transfer_stream):
+        if self._is_cuda:
+            with torch.cuda.stream(self._transfer_stream):
+                gpu_tensors = {}
+                for name, cpu_tensor in entry.cpu_tensors.items():
+                    gpu_tensor = torch.empty_like(
+                        cpu_tensor, device=self.device
+                    )
+                    gpu_tensor.copy_(cpu_tensor, non_blocking=True)
+                    gpu_tensors[name] = gpu_tensor
+                entry.gpu_tensors = gpu_tensors
+
+            event = torch.cuda.Event()
+            self._transfer_stream.record_event(event)
+            entry.transfer_event = event
+        else:
+            # CPU-to-CPU copy (for testing without GPU)
             gpu_tensors = {}
             for name, cpu_tensor in entry.cpu_tensors.items():
-                gpu_tensor = torch.empty_like(cpu_tensor, device=self.device)
-                gpu_tensor.copy_(cpu_tensor, non_blocking=True)
-                gpu_tensors[name] = gpu_tensor
+                gpu_tensors[name] = cpu_tensor.clone()
             entry.gpu_tensors = gpu_tensors
-
-        event = torch.cuda.Event()
-        self._transfer_stream.record_event(event)
-        entry.transfer_event = event
+            event = None
 
         self._gpu_memory_used += entry.memory_bytes
 
-        if sync:
+        if self._is_cuda and sync and event is not None:
             event.synchronize()
-            entry.location = ExpertLocation.GPU
-            entry.transfer_event = None
-            self._gpu_lru[key] = None
-            load_time = (time.monotonic() - load_start) * 1000
-            self.stats._load_time_sum += load_time
-            self.stats.total_loads += 1
-            self.stats.avg_load_time_ms = (
-                self.stats._load_time_sum / self.stats.total_loads
-            )
-        else:
-            self.stats.total_loads += 1
-            self._gpu_lru[key] = None
+
+        entry.location = ExpertLocation.GPU
+        entry.transfer_event = None
+        self._gpu_lru[key] = None
+        load_time = (time.monotonic() - load_start) * 1000
+        self.stats._load_time_sum += load_time
+        self.stats.total_loads += 1
+        self.stats.avg_load_time_ms = (
+            self.stats._load_time_sum / self.stats.total_loads
+        )
 
         return event
 
@@ -369,12 +380,17 @@ class ExpertCacheEngine:
             return False
 
         # Update CPU copy if GPU tensors were modified (e.g., by EPLB)
-        with torch.cuda.stream(self._transfer_stream):
+        if self._is_cuda and self._transfer_stream is not None:
+            with torch.cuda.stream(self._transfer_stream):
+                for name, gpu_tensor in entry.gpu_tensors.items():
+                    entry.cpu_tensors[name].copy_(
+                        gpu_tensor, non_blocking=True
+                    )
+            if sync:
+                self._transfer_stream.synchronize()
+        else:
             for name, gpu_tensor in entry.gpu_tensors.items():
-                entry.cpu_tensors[name].copy_(gpu_tensor, non_blocking=True)
-
-        if sync:
-            self._transfer_stream.synchronize()
+                entry.cpu_tensors[name].copy_(gpu_tensor)
 
         # Free GPU tensors
         entry.gpu_tensors = None

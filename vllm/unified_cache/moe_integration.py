@@ -18,13 +18,15 @@ Integration approach:
   unified_cache_config.enabled is True
 """
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.unified_cache.expert_cache_engine import ExpertCacheEngine, ExpertLocation
+from vllm.unified_cache.expert_predictor import ExpertPredictor
 from vllm.unified_cache.expert_tracker import ExpertActivationTracker
+from vllm.unified_cache.prefix_expert_dag import PrefixExpertDAG
 
 logger = init_logger(__name__)
 
@@ -48,8 +50,16 @@ class ExpertCacheRegistry:
         expert_cache_engine: ExpertCacheEngine,
         enable_tracking: bool = False,
         enable_cpu_compute: bool = False,
+        enable_prediction: bool = False,
+        dag_decay: float = 0.99,
+        dag_max_nodes: int = 100_000,
+        prediction_confidence: float = 0.1,
     ) -> "ExpertCacheRegistry":
-        instance = cls(expert_cache_engine, enable_tracking, enable_cpu_compute)
+        instance = cls(
+            expert_cache_engine, enable_tracking, enable_cpu_compute,
+            enable_prediction, dag_decay, dag_max_nodes,
+            prediction_confidence,
+        )
         cls._instance = instance
         return instance
 
@@ -62,6 +72,10 @@ class ExpertCacheRegistry:
         expert_cache_engine: ExpertCacheEngine,
         enable_tracking: bool = False,
         enable_cpu_compute: bool = False,
+        enable_prediction: bool = False,
+        dag_decay: float = 0.99,
+        dag_max_nodes: int = 100_000,
+        prediction_confidence: float = 0.1,
     ):
         self.cache_engine = expert_cache_engine
         self.tracker = ExpertActivationTracker.get_instance()
@@ -71,6 +85,26 @@ class ExpertCacheRegistry:
         # Map from layer_name (prefix) to layer_id for tracking
         self._layer_name_to_id: dict[str, int] = {}
         self._next_layer_id = 0
+
+        # Phase 3+4: Prefix-aware expert prediction
+        self.prediction_enabled = enable_prediction
+        self.dag: Optional[PrefixExpertDAG] = None
+        self.predictor: Optional[ExpertPredictor] = None
+        if enable_prediction:
+            self.dag = PrefixExpertDAG(
+                decay_factor=dag_decay,
+                max_nodes=dag_max_nodes,
+            )
+            self.predictor = ExpertPredictor(
+                dag=self.dag,
+                cache_engine=expert_cache_engine,
+                confidence_threshold=prediction_confidence,
+            )
+            logger.info(
+                "Expert prediction enabled: dag_decay=%.3f, "
+                "max_nodes=%d, confidence=%.2f",
+                dag_decay, dag_max_nodes, prediction_confidence,
+            )
 
     def get_layer_id(self, layer_name: str) -> int:
         """Get or assign a sequential layer ID for a named MoE layer."""
@@ -106,6 +140,19 @@ def unified_cache_pre_forward(
     if registry.tracker.enabled:
         registry.tracker.record(layer_id=layer_id, topk_ids=topk_ids)
 
+    # 1b. Record feedback into prefix-expert DAG (Phase 3+4)
+    if registry.prediction_enabled and registry.predictor is not None:
+        expert_ids = topk_ids.detach().cpu().flatten().tolist()
+        # Use _current_block_hashes if set by predict_for_request()
+        block_hashes = getattr(registry, '_current_block_hashes', None)
+        if block_hashes:
+            registry.predictor.record_feedback(
+                block_hashes=block_hashes,
+                layer_id=layer_id,
+                actual_expert_ids=expert_ids,
+                num_tokens=topk_ids.shape[0],
+            )
+
     # 2. Ensure selected experts are on GPU
     # Get unique expert IDs from the batch
     unique_experts = topk_ids.unique().cpu().tolist()
@@ -126,6 +173,41 @@ def unified_cache_pre_forward(
         # Must synchronize before compute to ensure weights are available
         for event in events:
             event.synchronize()
+
+
+def predict_experts_for_request(
+    block_hashes: Sequence[int],
+) -> dict[int, list[int]]:
+    """
+    Predict and prefetch experts for an incoming request (Phase 4).
+
+    Should be called at request scheduling time, before any MoE layers run.
+    This sets the current block hashes on the registry so that subsequent
+    unified_cache_pre_forward() calls can record feedback into the DAG.
+
+    Args:
+        block_hashes: Prefix block hashes from vLLM's KV cache lookup.
+
+    Returns:
+        Dict of layer_id -> list of prefetched expert_ids.
+    """
+    registry = ExpertCacheRegistry.get_instance()
+    if registry is None or not registry.prediction_enabled:
+        return {}
+    if registry.predictor is None:
+        return {}
+
+    # Store block hashes so forward hooks can record feedback
+    registry._current_block_hashes = list(block_hashes)
+
+    return registry.predictor.predict_and_prefetch(block_hashes)
+
+
+def clear_request_context() -> None:
+    """Clear per-request state after a request completes."""
+    registry = ExpertCacheRegistry.get_instance()
+    if registry is not None:
+        registry._current_block_hashes = None
 
 
 def unified_cache_get_expert_weights(

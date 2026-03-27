@@ -1693,15 +1693,33 @@ class FusedMoE(CustomOp):
                 # weights are loaded on GPU before MoE computation.
                 from vllm.unified_cache.moe_integration import (
                     unified_cache_pre_forward,
+                    unified_cache_split_compute,
                 )
                 unified_cache_pre_forward(self.layer_name, topk_ids)
 
-                final_hidden_states = self.quant_method.apply(
-                    layer=self,
-                    x=staged_hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
+                # Phase 2: CPU Active Compute — split GPU/CPU expert paths
+                cpu_contribution, gpu_topk_weights, split_active = (
+                    unified_cache_split_compute(
+                        self.layer_name, staged_hidden_states,
+                        topk_weights, topk_ids,
+                    )
                 )
+
+                if split_active and cpu_contribution is not None:
+                    final_hidden_states = self.quant_method.apply(
+                        layer=self,
+                        x=staged_hidden_states,
+                        topk_weights=gpu_topk_weights,
+                        topk_ids=topk_ids,
+                    )
+                    final_hidden_states = final_hidden_states + cpu_contribution
+                else:
+                    final_hidden_states = self.quant_method.apply(
+                        layer=self,
+                        x=staged_hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                    )
 
             if has_separate_shared_experts:
                 assert not isinstance(final_hidden_states, tuple)
@@ -1893,15 +1911,34 @@ class FusedMoE(CustomOp):
                 # weights are loaded on GPU before MoE computation.
                 from vllm.unified_cache.moe_integration import (
                     unified_cache_pre_forward,
+                    unified_cache_split_compute,
                 )
                 unified_cache_pre_forward(self.layer_name, topk_ids)
 
-                final_hidden_states = self.quant_method.apply(
-                    layer=self,
-                    x=x,  # The type signture of this is wrong due to the hack.
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
+                # Phase 2: CPU Active Compute — split GPU/CPU expert paths
+                cpu_contribution, gpu_topk_weights, split_active = (
+                    unified_cache_split_compute(
+                        self.layer_name, x, topk_weights, topk_ids,
+                    )
                 )
+
+                if split_active and cpu_contribution is not None:
+                    # GPU kernel runs with CPU-expert weights zeroed out
+                    final_hidden_states = self.quant_method.apply(
+                        layer=self,
+                        x=x,
+                        topk_weights=gpu_topk_weights,
+                        topk_ids=topk_ids,
+                    )
+                    # Merge CPU contributions
+                    final_hidden_states = final_hidden_states + cpu_contribution
+                else:
+                    final_hidden_states = self.quant_method.apply(
+                        layer=self,
+                        x=x,  # The type signture of this is wrong due to the hack.
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                    )
 
             if has_separate_shared_experts:
                 assert self.shared_experts is not None

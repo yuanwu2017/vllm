@@ -107,6 +107,7 @@ def maybe_init_unified_cache(
     ExpertCacheRegistry.initialize(
         expert_cache_engine=expert_cache,
         enable_tracking=uc_config.enable_expert_tracking,
+        enable_cpu_compute=uc_config.enable_cpu_compute,
     )
 
     # Configure tracker

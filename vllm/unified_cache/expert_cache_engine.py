@@ -486,6 +486,34 @@ class ExpertCacheEngine:
                 result.append(eid)
         return result
 
+    def get_cpu_expert_ids(self, layer_id: int) -> list[int]:
+        """Get list of expert IDs currently resident on CPU for a given layer."""
+        result = []
+        for (lid, eid), entry in self._cache.items():
+            if lid == layer_id and entry.location == ExpertLocation.CPU:
+                result.append(eid)
+        return result
+
+    def get_cpu_tensors(
+        self,
+        layer_id: int,
+        expert_id: int,
+    ) -> dict[str, torch.Tensor] | None:
+        """
+        Get CPU weight tensors for a given expert.
+
+        Used by the CPU active compute path to run expert FFN directly
+        on CPU without transferring weights to GPU.
+
+        Returns:
+            Dict of weight name -> CPU tensor, or None if not found.
+        """
+        key = (layer_id, expert_id)
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        return entry.cpu_tensors
+
     def get_all_gpu_expert_ids(self) -> dict[int, list[int]]:
         """Get mapping of layer_id -> list of GPU-resident expert IDs."""
         result: dict[int, list[int]] = {}

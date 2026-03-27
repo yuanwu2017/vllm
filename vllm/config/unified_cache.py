@@ -71,6 +71,13 @@ class UnifiedCacheConfig:
     """Maximum number of expert activation records to keep in memory.
     Older records are discarded when the limit is reached."""
 
+    enable_cpu_compute: bool = False
+    """Whether to enable CPU active compute for MoE experts. When True,
+    expert FFN computations for CPU-resident (evicted) experts are run
+    directly on CPU instead of waiting for CPU→GPU weight transfer.
+    This can reduce latency when few tokens are routed to a cold expert,
+    as the CPU matmul is faster than the PCIe transfer overhead."""
+
     def __post_init__(self):
         if self.min_kv_ratio >= self.max_kv_ratio:
             raise ValueError(

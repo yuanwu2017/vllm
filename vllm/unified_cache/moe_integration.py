@@ -23,7 +23,7 @@ from typing import Optional
 import torch
 
 from vllm.logger import init_logger
-from vllm.unified_cache.expert_cache_engine import ExpertCacheEngine
+from vllm.unified_cache.expert_cache_engine import ExpertCacheEngine, ExpertLocation
 from vllm.unified_cache.expert_tracker import ExpertActivationTracker
 
 logger = init_logger(__name__)
@@ -47,8 +47,9 @@ class ExpertCacheRegistry:
         cls,
         expert_cache_engine: ExpertCacheEngine,
         enable_tracking: bool = False,
+        enable_cpu_compute: bool = False,
     ) -> "ExpertCacheRegistry":
-        instance = cls(expert_cache_engine, enable_tracking)
+        instance = cls(expert_cache_engine, enable_tracking, enable_cpu_compute)
         cls._instance = instance
         return instance
 
@@ -60,11 +61,13 @@ class ExpertCacheRegistry:
         self,
         expert_cache_engine: ExpertCacheEngine,
         enable_tracking: bool = False,
+        enable_cpu_compute: bool = False,
     ):
         self.cache_engine = expert_cache_engine
         self.tracker = ExpertActivationTracker.get_instance()
         if enable_tracking:
             self.tracker.enable()
+        self.cpu_compute_enabled = enable_cpu_compute
         # Map from layer_name (prefix) to layer_id for tracking
         self._layer_name_to_id: dict[str, int] = {}
         self._next_layer_id = 0
@@ -199,3 +202,116 @@ def register_experts_from_layer(
         layer_id,
         len(initial_gpu_experts & set(weight_dict.keys())),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: CPU Active Compute — split dispatch
+# ---------------------------------------------------------------------------
+
+
+def unified_cache_split_compute(
+    layer_name: str,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], bool]:
+    """
+    Decide whether to split MoE computation between GPU and CPU.
+
+    If all selected experts are on GPU, returns (None, None, False) — the
+    caller should use the fast fused kernel as usual.
+
+    If some experts are on CPU, returns:
+        (cpu_contribution, gpu_topk_weights, True)
+    where:
+        - cpu_contribution: (num_tokens, hidden_dim) tensor ON GPU containing
+          the weighted output of CPU-computed experts.
+        - gpu_topk_weights: Modified topk_weights with CPU expert weights
+          zeroed out, so the GPU kernel ignores those slots.
+        - True: Indicates split compute is active.
+
+    The caller should then run:
+        gpu_result = quant_method.apply(layer, x, gpu_topk_weights, topk_ids)
+        final = gpu_result + cpu_contribution
+
+    Args:
+        layer_name: FusedMoE layer's prefix name.
+        x: Input hidden states on GPU. Shape: (num_tokens, hidden_dim).
+        topk_weights: Router weights. Shape: (num_tokens, top_k).
+        topk_ids: Selected expert IDs. Shape: (num_tokens, top_k).
+        activation: Activation function name for the expert FFN.
+
+    Returns:
+        Tuple of (cpu_contribution, gpu_topk_weights, split_active).
+    """
+    registry = ExpertCacheRegistry.get_instance()
+    if registry is None:
+        return None, None, False
+
+    # Check if CPU active compute is enabled
+    if not getattr(registry, 'cpu_compute_enabled', False):
+        return None, None, False
+
+    layer_id = registry.get_layer_id(layer_name)
+    cache = registry.cache_engine
+
+    # Find which selected experts are on CPU
+    unique_experts = topk_ids.unique().cpu().tolist()
+    cpu_expert_set = set()
+    gpu_expert_set = set()
+
+    for eid in unique_experts:
+        eid = int(eid)
+        entry = cache._cache.get((layer_id, eid))
+        if entry is None:
+            continue
+        if entry.location == ExpertLocation.CPU:
+            cpu_expert_set.add(eid)
+        elif entry.location == ExpertLocation.GPU:
+            gpu_expert_set.add(eid)
+        elif entry.location == ExpertLocation.LOADING:
+            # Still loading — treat as GPU (will block on sync)
+            gpu_expert_set.add(eid)
+
+    if not cpu_expert_set:
+        # All on GPU — fall through to normal fused kernel
+        return None, None, False
+
+    # Lazy import to avoid circular dependency at module load
+    from vllm.unified_cache.cpu_expert_compute import (
+        compute_cpu_expert_contributions,
+        create_gpu_only_weights,
+    )
+
+    # 1. Compute CPU expert contributions
+    def cpu_weight_getter(expert_id: int):
+        return cache.get_cpu_tensors(layer_id, expert_id)
+
+    cpu_contribution = compute_cpu_expert_contributions(
+        x_gpu=x,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        cpu_expert_set=cpu_expert_set,
+        cpu_weight_getter=cpu_weight_getter,
+        activation=activation,
+    )
+
+    # 2. Zero out CPU experts in GPU weights
+    gpu_topk_weights = create_gpu_only_weights(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        cpu_expert_set=cpu_expert_set,
+    )
+
+    # 3. Load the CPU experts to GPU in the background for next time
+    #    (non-blocking — the CPU compute already produced the result)
+    for eid in cpu_expert_set:
+        cache.load_expert(layer_id, eid, sync=False)
+
+    logger.debug(
+        "Split compute for layer %s: %d GPU experts, %d CPU experts",
+        layer_name, len(gpu_expert_set), len(cpu_expert_set),
+    )
+
+    return cpu_contribution, gpu_topk_weights, True

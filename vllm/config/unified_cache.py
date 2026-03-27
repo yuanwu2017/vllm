@@ -78,6 +78,24 @@ class UnifiedCacheConfig:
     This can reduce latency when few tokens are routed to a cold expert,
     as the CPU matmul is faster than the PCIe transfer overhead."""
 
+    enable_expert_prediction: bool = False
+    """Whether to enable prefix-aware expert prediction (Phase 3+4).
+    When True, a PrefixExpertDAG is built from observed expert activations
+    and used to proactively prefetch experts before MoE layers run."""
+
+    prediction_confidence: float = Field(default=0.1, ge=0, le=1)
+    """Minimum predicted probability to trigger async expert prefetch.
+    Lower values are more aggressive (prefetch more, waste some bandwidth).
+    Higher values are conservative (fewer prefetches, more cache misses)."""
+
+    dag_decay_factor: float = Field(default=0.99, gt=0, le=1)
+    """Exponential decay for old observations in the PrefixExpertDAG.
+    1.0 = no decay (pure accumulation). Lower values forget older data."""
+
+    dag_max_nodes: int = Field(default=100_000, ge=1000)
+    """Maximum number of nodes in the PrefixExpertDAG. Oldest nodes
+    are evicted when this limit is exceeded."""
+
     def __post_init__(self):
         if self.min_kv_ratio >= self.max_kv_ratio:
             raise ValueError(

@@ -108,6 +108,10 @@ def maybe_init_unified_cache(
         expert_cache_engine=expert_cache,
         enable_tracking=uc_config.enable_expert_tracking,
         enable_cpu_compute=uc_config.enable_cpu_compute,
+        enable_prediction=uc_config.enable_expert_prediction,
+        dag_decay=uc_config.dag_decay_factor,
+        dag_max_nodes=uc_config.dag_max_nodes,
+        prediction_confidence=uc_config.prediction_confidence,
     )
 
     # Configure tracker

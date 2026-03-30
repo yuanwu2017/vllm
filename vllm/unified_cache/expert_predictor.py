@@ -123,7 +123,13 @@ class ExpertPredictor:
                 event = self.cache_engine.load_expert(
                     layer_id, expert_id, sync=False
                 )
-                if event is not None:
+                # load_expert returns None if already on GPU or on CPU-only
+                # devices (where loads are synchronous). Check the entry
+                # location to confirm the load was issued/completed.
+                entry_after = self.cache_engine._cache.get(key)
+                if entry_after and entry_after.location in (
+                    ExpertLocation.GPU, ExpertLocation.LOADING,
+                ):
                     layer_prefetched.append(expert_id)
                     self._experts_prefetched += 1
 

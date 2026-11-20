@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-ExpertCacheEngine: Manages MoE expert weight tensors across GPU and CPU memory.
+"""ExpertCacheEngine: Manages MoE expert weight tensors across GPU and CPU memory.
 
 Instead of keeping all expert weights permanently on GPU, this engine
 dynamically loads/evicts expert weights between GPU HBM and CPU DRAM based
@@ -20,7 +19,6 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 import torch
 
@@ -31,21 +29,23 @@ logger = init_logger(__name__)
 
 class ExpertLocation(Enum):
     """Where an expert's weights currently reside."""
+
     GPU = "gpu"
     CPU = "cpu"
-    LOADING = "loading"   # Currently being transferred GPU←CPU
+    LOADING = "loading"  # Currently being transferred GPU←CPU
     EVICTING = "evicting"  # Currently being transferred GPU→CPU
 
 
 @dataclass
 class ExpertCacheEntry:
     """Metadata for a single cached expert."""
+
     layer_id: int
     expert_id: int
     location: ExpertLocation
     # Weight tensors: w13 (gate_up fused) and w2 (down_proj)
-    gpu_tensors: Optional[dict[str, torch.Tensor]] = None
-    cpu_tensors: Optional[dict[str, torch.Tensor]] = None
+    gpu_tensors: dict[str, torch.Tensor] | None = None
+    cpu_tensors: dict[str, torch.Tensor] | None = None
     # Access statistics
     access_count: int = 0
     last_access_time: float = 0.0
@@ -53,12 +53,13 @@ class ExpertCacheEntry:
     # Memory accounting
     memory_bytes: int = 0
     # Transfer state
-    transfer_event: Optional[torch.cuda.Event] = None
+    transfer_event: torch.cuda.Event | None = None
 
 
 @dataclass
 class ExpertCacheStats:
     """Runtime statistics for the expert cache."""
+
     total_loads: int = 0
     total_evictions: int = 0
     cache_hits: int = 0
@@ -70,8 +71,7 @@ class ExpertCacheStats:
 
 
 class ExpertCacheEngine:
-    """
-    Manages expert weight tensors across GPU HBM and CPU DRAM.
+    """Manages expert weight tensors across GPU HBM and CPU DRAM.
 
     Design principles:
     1. Hot experts stay on GPU, cold experts move to CPU
@@ -85,6 +85,7 @@ class ExpertCacheEngine:
         device: CUDA device for GPU tensors.
         ema_decay: Decay factor for exponential moving average of access rates.
         pin_cpu_memory: Whether to use pinned (page-locked) CPU memory.
+
     """
 
     def __init__(
@@ -139,8 +140,7 @@ class ExpertCacheEngine:
         weight_tensors: dict[str, torch.Tensor],
         on_gpu: bool = True,
     ) -> None:
-        """
-        Register an expert's weights with the cache engine.
+        """Register an expert's weights with the cache engine.
 
         Called during model initialization to register all expert weights.
         Initially all experts are on GPU (matching vLLM's default behavior).
@@ -148,12 +148,14 @@ class ExpertCacheEngine:
         Args:
             layer_id: The transformer layer index.
             expert_id: The expert index within the layer.
-            weight_tensors: Dict of weight name -> tensor (e.g., {"w13": ..., "w2": ...}).
+            weight_tensors: Mapping of weight names to tensors.
             on_gpu: Whether the expert is initially on GPU.
+
         """
         key = (layer_id, expert_id)
-        memory_bytes = sum(t.nelement() * t.element_size()
-                           for t in weight_tensors.values())
+        memory_bytes = sum(
+            t.nelement() * t.element_size() for t in weight_tensors.values()
+        )
 
         if on_gpu:
             # Create CPU copies in pinned memory for fast transfers
@@ -213,8 +215,7 @@ class ExpertCacheEngine:
         layer_id: int,
         expert_id: int,
     ) -> dict[str, torch.Tensor] | None:
-        """
-        Get expert weight tensors on GPU. Returns None if expert needs loading.
+        """Get expert weight tensors on GPU. Returns None if expert needs loading.
 
         This is the hot path — called during every MoE forward pass.
         Updates access statistics and LRU order.
@@ -225,6 +226,7 @@ class ExpertCacheEngine:
 
         Returns:
             Dict of weight tensors on GPU, or None if not cached on GPU.
+
         """
         key = (layer_id, expert_id)
         entry = self._cache.get(key)
@@ -237,8 +239,8 @@ class ExpertCacheEngine:
             # Cache hit — update stats
             entry.access_count += 1
             entry.last_access_time = now
-            entry.ema_access_rate = (
-                self.ema_decay * entry.ema_access_rate + (1 - self.ema_decay)
+            entry.ema_access_rate = self.ema_decay * entry.ema_access_rate + (
+                1 - self.ema_decay
             )
             # Move to end of LRU (most recently used)
             self._gpu_lru.move_to_end(key)
@@ -260,8 +262,8 @@ class ExpertCacheEngine:
         # Cache miss
         self.stats.cache_misses += 1
         # Update EMA to reflect that we needed this expert but it wasn't on GPU
-        entry.ema_access_rate = (
-            self.ema_decay * entry.ema_access_rate + (1 - self.ema_decay)
+        entry.ema_access_rate = self.ema_decay * entry.ema_access_rate + (
+            1 - self.ema_decay
         )
         return None
 
@@ -271,8 +273,7 @@ class ExpertCacheEngine:
         expert_id: int,
         sync: bool = False,
     ) -> torch.cuda.Event | None:
-        """
-        Load an expert from CPU→GPU asynchronously.
+        """Load an expert from CPU→GPU asynchronously.
 
         Uses a dedicated CUDA stream for async transfer. Returns a CUDA event
         that can be used to synchronize when the transfer is complete.
@@ -284,19 +285,27 @@ class ExpertCacheEngine:
 
         Returns:
             CUDA event for synchronization, or None if already on GPU.
+
         """
         key = (layer_id, expert_id)
         entry = self._cache.get(key)
         if entry is None:
-            logger.warning("Cannot load unregistered expert (%d, %d)",
-                           layer_id, expert_id)
+            logger.warning(
+                "Cannot load unregistered expert (%d, %d)", layer_id, expert_id
+            )
             return None
 
         if entry.location == ExpertLocation.GPU:
             return None  # Already on GPU
 
         if entry.location == ExpertLocation.LOADING:
+            if sync:
+                self.get_expert(layer_id, expert_id)
+                return None
             return entry.transfer_event  # Already loading
+
+        if entry.cpu_tensors is None:
+            raise RuntimeError(f"Expert {key} has no CPU weights to load")
 
         # Ensure GPU has space
         while self._gpu_memory_used + entry.memory_bytes > self.gpu_memory_budget:
@@ -304,7 +313,8 @@ class ExpertCacheEngine:
                 logger.warning(
                     "Cannot free GPU memory for expert (%d, %d). "
                     "GPU used: %d, budget: %d, needed: %d",
-                    layer_id, expert_id,
+                    layer_id,
+                    expert_id,
                     self._gpu_memory_used,
                     self.gpu_memory_budget,
                     entry.memory_bytes,
@@ -316,12 +326,11 @@ class ExpertCacheEngine:
         entry.location = ExpertLocation.LOADING
 
         if self._is_cuda:
+            assert self._transfer_stream is not None
             with torch.cuda.stream(self._transfer_stream):
                 gpu_tensors = {}
                 for name, cpu_tensor in entry.cpu_tensors.items():
-                    gpu_tensor = torch.empty_like(
-                        cpu_tensor, device=self.device
-                    )
+                    gpu_tensor = torch.empty_like(cpu_tensor, device=self.device)
                     gpu_tensor.copy_(cpu_tensor, non_blocking=True)
                     gpu_tensors[name] = gpu_tensor
                 entry.gpu_tensors = gpu_tensors
@@ -342,15 +351,14 @@ class ExpertCacheEngine:
         if self._is_cuda and sync and event is not None:
             event.synchronize()
 
-        entry.location = ExpertLocation.GPU
-        entry.transfer_event = None
+        if not self._is_cuda or sync:
+            entry.location = ExpertLocation.GPU
+            entry.transfer_event = None
         self._gpu_lru[key] = None
         load_time = (time.monotonic() - load_start) * 1000
         self.stats._load_time_sum += load_time
         self.stats.total_loads += 1
-        self.stats.avg_load_time_ms = (
-            self.stats._load_time_sum / self.stats.total_loads
-        )
+        self.stats.avg_load_time_ms = self.stats._load_time_sum / self.stats.total_loads
 
         return event
 
@@ -360,8 +368,7 @@ class ExpertCacheEngine:
         expert_id: int,
         sync: bool = False,
     ) -> bool:
-        """
-        Evict an expert from GPU→CPU.
+        """Evict an expert from GPU→CPU.
 
         The CPU copy is already maintained (updated during load), so eviction
         just frees the GPU tensors.
@@ -373,21 +380,25 @@ class ExpertCacheEngine:
 
         Returns:
             True if eviction was performed.
+
         """
         key = (layer_id, expert_id)
         entry = self._cache.get(key)
+        if entry is not None and entry.location == ExpertLocation.LOADING:
+            self.get_expert(layer_id, expert_id)
         if entry is None or entry.location != ExpertLocation.GPU:
             return False
 
+        if entry.gpu_tensors is None or entry.cpu_tensors is None:
+            raise RuntimeError(f"Resident expert {key} is missing weight storage")
+
         # Update CPU copy if GPU tensors were modified (e.g., by EPLB)
         if self._is_cuda and self._transfer_stream is not None:
+            self._transfer_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self._transfer_stream):
                 for name, gpu_tensor in entry.gpu_tensors.items():
-                    entry.cpu_tensors[name].copy_(
-                        gpu_tensor, non_blocking=True
-                    )
-            if sync:
-                self._transfer_stream.synchronize()
+                    entry.cpu_tensors[name].copy_(gpu_tensor, non_blocking=True)
+            self._transfer_stream.synchronize()
         else:
             for name, gpu_tensor in entry.gpu_tensors.items():
                 entry.cpu_tensors[name].copy_(gpu_tensor)
@@ -406,8 +417,7 @@ class ExpertCacheEngine:
         layer_id: int,
         expert_ids: list[int],
     ) -> list[torch.cuda.Event]:
-        """
-        Prefetch a set of experts for a given layer.
+        """Prefetch a set of experts for a given layer.
 
         Called before MoE forward pass when we know which experts will be
         needed (from router logits). Loads any missing experts asynchronously.
@@ -418,6 +428,7 @@ class ExpertCacheEngine:
 
         Returns:
             List of CUDA events for pending transfers.
+
         """
         events = []
         for expert_id in expert_ids:
@@ -439,8 +450,7 @@ class ExpertCacheEngine:
         return events
 
     def _evict_one(self) -> bool:
-        """
-        Evict the least-recently-used GPU expert to CPU.
+        """Evict the least-recently-used GPU expert to CPU.
 
         Returns True if an expert was evicted.
         """
@@ -456,8 +466,7 @@ class ExpertCacheEngine:
         self,
         count: int = 1,
     ) -> list[tuple[int, int, float]]:
-        """
-        Get the best candidates for eviction based on access patterns.
+        """Get the best candidates for eviction based on access patterns.
 
         Returns list of (layer_id, expert_id, score) sorted by score
         (lowest score = best eviction candidate).
@@ -499,14 +508,14 @@ class ExpertCacheEngine:
         layer_id: int,
         expert_id: int,
     ) -> dict[str, torch.Tensor] | None:
-        """
-        Get CPU weight tensors for a given expert.
+        """Get CPU weight tensors for a given expert.
 
         Used by the CPU active compute path to run expert FFN directly
         on CPU without transferring weights to GPU.
 
         Returns:
             Dict of weight name -> CPU tensor, or None if not found.
+
         """
         key = (layer_id, expert_id)
         entry = self._cache.get(key)
@@ -544,8 +553,7 @@ class ExpertCacheEngine:
         return self.stats.cache_hits / total
 
     def update_gpu_budget(self, new_budget: int) -> None:
-        """
-        Dynamically update the GPU memory budget for expert cache.
+        """Dynamically update the GPU memory budget for expert cache.
 
         Called by UnifiedCacheManager during memory rebalancing.
         May trigger evictions if the new budget is smaller.

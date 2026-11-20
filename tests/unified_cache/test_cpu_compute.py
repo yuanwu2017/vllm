@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Unit tests for Phase 2: CPU Active Compute.
+"""Unit tests for Phase 2: CPU Active Compute.
 
 Tests the cpu_expert_compute module, split dispatch logic in
 moe_integration, and the end-to-end GPU/CPU merge path.
@@ -11,20 +10,19 @@ import pytest
 import torch
 
 from vllm.unified_cache.cpu_expert_compute import (
-    cpu_expert_ffn,
     compute_cpu_expert_contributions,
+    cpu_expert_ffn,
     create_gpu_only_weights,
 )
 from vllm.unified_cache.expert_cache_engine import (
     ExpertCacheEngine,
-    ExpertLocation,
 )
 from vllm.unified_cache.moe_integration import (
     ExpertCacheRegistry,
-    unified_cache_pre_forward,
+    offload_experts_from_layer,
+    unified_cache_forward,
     unified_cache_split_compute,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,12 +36,8 @@ DTYPE = torch.float32  # Use fp32 for numerical accuracy in tests
 def _make_expert_tensors(device: str = "cpu"):
     """Create mock expert weight tensors."""
     return {
-        "w13_weight": torch.randn(
-            INTERMEDIATE * 2, HIDDEN, dtype=DTYPE, device=device
-        ),
-        "w2_weight": torch.randn(
-            HIDDEN, INTERMEDIATE, dtype=DTYPE, device=device
-        ),
+        "w13_weight": torch.randn(INTERMEDIATE * 2, HIDDEN, dtype=DTYPE, device=device),
+        "w2_weight": torch.randn(HIDDEN, INTERMEDIATE, dtype=DTYPE, device=device),
     }
 
 
@@ -56,6 +50,7 @@ def _make_cache_engine(
 
     Args:
         gpu_experts: Set of expert IDs to keep on GPU. Defaults to {0, 1}.
+
     """
     if gpu_experts is None:
         gpu_experts = {0, 1}
@@ -81,6 +76,71 @@ def _make_cache_engine(
 # ---------------------------------------------------------------------------
 # Tests: cpu_expert_ffn
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("cpu_compute", [False, True])
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+def test_offloaded_forward_matches_resident_weights(device, cpu_compute, activation):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(42)
+    layer = torch.nn.Module()
+    layer.layer_name = "test.offloaded"
+    layer.w13_weight = torch.nn.Parameter(
+        torch.randn(4, INTERMEDIATE * 2, HIDDEN, device=device) * 0.1,
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.randn(4, HIDDEN, INTERMEDIATE, device=device) * 0.1,
+        requires_grad=False,
+    )
+    inputs = torch.randn(3, HIDDEN, device=device)
+    topk_ids = torch.tensor([[0, 2], [1, 3], [2, 3]], device=device)
+    topk_weights = torch.tensor([[0.6, 0.4]] * 3, device=device)
+    expected = torch.zeros_like(inputs)
+    for token_id in range(3):
+        for slot_id in range(2):
+            expert_id = topk_ids[token_id, slot_id]
+            expected[token_id] += (
+                cpu_expert_ffn(
+                    inputs[token_id : token_id + 1],
+                    layer.w13_weight[expert_id],
+                    layer.w2_weight[expert_id],
+                    activation,
+                ).squeeze(0)
+                * topk_weights[token_id, slot_id]
+            )
+    expert_bytes = (INTERMEDIATE * 2 * HIDDEN + HIDDEN * INTERMEDIATE) * 4
+    engine = ExpertCacheEngine(
+        gpu_memory_budget=expert_bytes,
+        cpu_memory_budget=expert_bytes * 4,
+        device=torch.device(device),
+        pin_cpu_memory=device == "cuda",
+    )
+    ExpertCacheRegistry.initialize(engine, enable_cpu_compute=cpu_compute)
+    try:
+        before = torch.accelerator.memory_allocated() if device == "cuda" else 0
+        offload_experts_from_layer(layer)
+        assert layer.w13_weight.device.type == "cpu"
+        assert engine.gpu_memory_used == expert_bytes
+        if device == "cuda":
+            torch.accelerator.synchronize()
+            assert before - torch.accelerator.memory_allocated() >= 3 * expert_bytes
+        for _ in range(3):
+            actual = unified_cache_forward(
+                layer.layer_name,
+                inputs,
+                topk_weights,
+                topk_ids,
+                activation,
+            )
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+            assert engine.gpu_memory_used <= expert_bytes
+        if cpu_compute:
+            assert engine.stats.total_loads == 1
+    finally:
+        ExpertCacheRegistry.reset()
 
 
 class TestCpuExpertFfn:
@@ -205,8 +265,10 @@ class TestComputeCpuExpertContributions:
 
     def _simple_weight_getter(self, expert_weights):
         """Create a weight getter from a dict of expert_id -> weights."""
+
         def getter(expert_id):
             return expert_weights.get(expert_id)
+
         return getter
 
     def test_no_cpu_experts_returns_none(self):
@@ -216,7 +278,10 @@ class TestComputeCpuExpertContributions:
         topk_ids = torch.tensor([[0, 1]] * 4)
 
         result = compute_cpu_expert_contributions(
-            x, topk_weights, topk_ids, set(),
+            x,
+            topk_weights,
+            topk_ids,
+            set(),
             lambda eid: None,
         )
         assert result is None
@@ -228,7 +293,10 @@ class TestComputeCpuExpertContributions:
         topk_ids = torch.tensor([[0, 1]] * 4)
 
         result = compute_cpu_expert_contributions(
-            x, topk_weights, topk_ids, {5, 6},  # experts 5,6 not in topk_ids
+            x,
+            topk_weights,
+            topk_ids,
+            {5, 6},  # experts 5,6 not in topk_ids
             lambda eid: _make_expert_tensors(),
         )
         assert result is None
@@ -241,7 +309,10 @@ class TestComputeCpuExpertContributions:
 
         expert_weights = {2: _make_expert_tensors()}
         result = compute_cpu_expert_contributions(
-            x, topk_weights, topk_ids, {2},
+            x,
+            topk_weights,
+            topk_ids,
+            {2},
             self._simple_weight_getter(expert_weights),
         )
         assert result is not None
@@ -258,7 +329,10 @@ class TestComputeCpuExpertContributions:
         topk_ids = torch.tensor([[0, 1], [0, 1]])
 
         result = compute_cpu_expert_contributions(
-            x, topk_weights, topk_ids, {1},
+            x,
+            topk_weights,
+            topk_ids,
+            {1},
             lambda eid: weights if eid == 1 else None,
         )
         assert result is not None
@@ -278,17 +352,24 @@ class TestComputeCpuExpertContributions:
 
         # Each token routes to experts 1 and 2 (both on CPU)
         topk_weights = torch.tensor(
-            [[0.6, 0.4]] * 4, dtype=DTYPE,
+            [[0.6, 0.4]] * 4,
+            dtype=DTYPE,
         )
         topk_ids = torch.tensor([[1, 2]] * 4)
 
         def getter(eid):
-            if eid == 1: return w_e1
-            if eid == 2: return w_e2
+            if eid == 1:
+                return w_e1
+            if eid == 2:
+                return w_e2
             return None
 
         result = compute_cpu_expert_contributions(
-            x, topk_weights, topk_ids, {1, 2}, getter,
+            x,
+            topk_weights,
+            topk_ids,
+            {1, 2},
+            getter,
         )
         assert result is not None
 
@@ -311,7 +392,8 @@ class TestSplitCompute:
         """Create cache engine and registry before each test."""
         ExpertCacheRegistry.reset()
         self.engine = _make_cache_engine(
-            num_layers=1, num_experts=4,
+            num_layers=1,
+            num_experts=4,
             gpu_experts={0, 1},  # experts 2 and 3 are on CPU
         )
         ExpertCacheRegistry.initialize(
@@ -333,7 +415,10 @@ class TestSplitCompute:
         topk_ids = torch.tensor([[0, 1]] * 4)  # experts 0,1 on GPU
 
         cpu_contrib, gpu_weights, active = unified_cache_split_compute(
-            "test.layer.0", x, topk_weights, topk_ids,
+            "test.layer.0",
+            x,
+            topk_weights,
+            topk_ids,
         )
         assert active is False
         assert cpu_contrib is None
@@ -346,7 +431,10 @@ class TestSplitCompute:
         topk_ids = torch.tensor([[0, 2]] * 4)  # expert 2 on CPU
 
         cpu_contrib, gpu_weights, active = unified_cache_split_compute(
-            "test.layer.0", x, topk_weights, topk_ids,
+            "test.layer.0",
+            x,
+            topk_weights,
+            topk_ids,
         )
         assert active is True
         assert cpu_contrib is not None
@@ -373,7 +461,10 @@ class TestSplitCompute:
         topk_ids = torch.tensor([[0, 2]] * 4)  # expert 2 on CPU
 
         cpu_contrib, gpu_weights, active = unified_cache_split_compute(
-            "test.layer.0", x, topk_weights, topk_ids,
+            "test.layer.0",
+            x,
+            topk_weights,
+            topk_ids,
         )
         assert active is False
 
@@ -386,7 +477,10 @@ class TestSplitCompute:
         topk_ids = torch.tensor([[0, 2]] * 4)
 
         cpu_contrib, gpu_weights, active = unified_cache_split_compute(
-            "test.layer.0", x, topk_weights, topk_ids,
+            "test.layer.0",
+            x,
+            topk_weights,
+            topk_ids,
         )
         assert active is False
 
@@ -398,7 +492,10 @@ class TestSplitCompute:
         topk_ids = torch.tensor([[0, 2]] * 4)  # 0=GPU, 2=CPU
 
         cpu_contrib, gpu_weights, active = unified_cache_split_compute(
-            "test.layer.0", x, topk_weights, topk_ids,
+            "test.layer.0",
+            x,
+            topk_weights,
+            topk_ids,
         )
         assert active is True
 
@@ -429,14 +526,16 @@ class TestEngineNewMethods:
 
     def test_get_cpu_expert_ids(self):
         engine = _make_cache_engine(
-            num_experts=4, gpu_experts={0, 1},
+            num_experts=4,
+            gpu_experts={0, 1},
         )
         cpu_ids = engine.get_cpu_expert_ids(layer_id=0)
         assert sorted(cpu_ids) == [2, 3]
 
     def test_get_cpu_tensors(self):
         engine = _make_cache_engine(
-            num_experts=4, gpu_experts={0, 1},
+            num_experts=4,
+            gpu_experts={0, 1},
         )
         tensors = engine.get_cpu_tensors(layer_id=0, expert_id=2)
         assert tensors is not None
@@ -447,7 +546,8 @@ class TestEngineNewMethods:
     def test_get_cpu_tensors_gpu_expert(self):
         """GPU experts also have cpu_tensors (pinned copies)."""
         engine = _make_cache_engine(
-            num_experts=4, gpu_experts={0, 1},
+            num_experts=4,
+            gpu_experts={0, 1},
         )
         tensors = engine.get_cpu_tensors(layer_id=0, expert_id=0)
         assert tensors is not None
@@ -456,3 +556,76 @@ class TestEngineNewMethods:
         engine = _make_cache_engine(num_experts=2)
         tensors = engine.get_cpu_tensors(layer_id=0, expert_id=99)
         assert tensors is None
+
+
+@pytest.mark.slow_test
+def test_llm_cpu_offload_matches_gpu_and_registers_experts(tmp_path, monkeypatch):
+    from transformers import MixtralConfig, MixtralForCausalLM
+
+    from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("TRITON_F32_DEFAULT", "ieee")
+    torch.manual_seed(42)
+    model_config = MixtralConfig(
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        max_position_embeddings=64,
+    )
+    model = MixtralForCausalLM(model_config)
+    model.save_pretrained(tmp_path)
+    del model
+    results = []
+    for enabled in (False, True):
+        llm = LLM(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+            dtype="float32",
+            max_model_len=64,
+            max_num_batched_tokens=32,
+            max_num_seqs=4,
+            kv_cache_memory_bytes=64 * 1024 * 1024,
+            gpu_memory_utilization=0.1,
+            kernel_config={"moe_backend": "triton"},
+            unified_cache_config={
+                "enabled": enabled,
+                "enable_cpu_compute": True,
+                "expert_cpu_memory_gb": 0.05,
+            },
+        )
+        try:
+            registry = ExpertCacheRegistry.get_instance()
+            if enabled:
+                assert registry is not None
+                assert len(registry.offloaded_layers) == 2
+                cache = registry.cache_engine
+                assert 0 < cache.gpu_memory_used < cache.cpu_memory_used
+                assert cache.gpu_memory_used <= cache.gpu_memory_budget
+            outputs = llm.generate(
+                [{"prompt_token_ids": [1, 5, 8, 12]}],
+                SamplingParams(
+                    temperature=0, max_tokens=4, ignore_eos=True, logprobs=1
+                ),
+                use_tqdm=False,
+            )
+            results.append(outputs[0].outputs[0])
+            if enabled:
+                assert cache.stats.cache_misses > 0
+        finally:
+            llm.llm_engine.engine_core.shutdown()
+            del llm
+        assert ExpertCacheRegistry.get_instance() is None
+    assert results[0].token_ids == results[1].token_ids
+    for baseline, offloaded, token_id in zip(
+        results[0].logprobs, results[1].logprobs, results[0].token_ids
+    ):
+        assert offloaded[token_id].logprob == pytest.approx(
+            baseline[token_id].logprob, abs=1e-4
+        )

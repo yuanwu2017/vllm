@@ -642,6 +642,11 @@ class Worker(WorkerBase):
             self._external_weight_charges.track(),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+            from vllm.unified_cache.engine_init import initialize_model_expert_cache
+
+            self.model_runner.model_memory_usage -= initialize_model_expert_cache(
+                self.vllm_config, self.model_runner.get_model(), self.device
+            )
 
         if self._external_weight_charges.fallback_bytes:
             self.requested_memory = self._resolve_requested_memory()
@@ -1875,6 +1880,10 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         gc.unfreeze()
+
+        from vllm.unified_cache.engine_init import shutdown_unified_cache
+
+        shutdown_unified_cache()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

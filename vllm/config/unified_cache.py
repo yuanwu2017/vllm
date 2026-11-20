@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Configuration for the Unified KV + Expert Cache system.
-"""
+"""Configuration for the Unified KV + Expert Cache system."""
 
 from pydantic import Field
-from pydantic.dataclasses import dataclass
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -14,7 +11,6 @@ logger = init_logger(__name__)
 
 
 @config
-@dataclass
 class UnifiedCacheConfig:
     """Configuration for the unified KV + Expert cache system.
 
@@ -27,9 +23,9 @@ class UnifiedCacheConfig:
     with its standard behavior (all experts permanently on GPU)."""
 
     expert_gpu_memory_fraction: float = Field(default=0.3, gt=0, le=0.8)
-    """Fraction of total cache budget to initially allocate for expert weights.
-    The remaining fraction is for KV cache. This ratio is dynamically adjusted
-    at runtime based on workload pressure."""
+    """Fraction of loaded expert weight bytes retained on GPU by the experimental
+    eager runtime. Freed memory is available to the normal KV cache profiler.
+    Runtime resizing of allocated KV cache blocks is not implemented."""
 
     expert_cpu_memory_gb: float = Field(default=50.0, ge=0)
     """CPU memory (in GiB) to allocate for expert weight storage. Expert
@@ -107,13 +103,55 @@ class UnifiedCacheConfig:
             logger.warning(
                 "Initial KV ratio (%.2f) is below min_kv_ratio (%.2f). "
                 "Adjusting expert_gpu_memory_fraction.",
-                initial_kv_ratio, self.min_kv_ratio,
+                initial_kv_ratio,
+                self.min_kv_ratio,
             )
             self.expert_gpu_memory_fraction = 1.0 - self.min_kv_ratio
         if initial_kv_ratio > self.max_kv_ratio:
             logger.warning(
                 "Initial KV ratio (%.2f) exceeds max_kv_ratio (%.2f). "
                 "Adjusting expert_gpu_memory_fraction.",
-                initial_kv_ratio, self.max_kv_ratio,
+                initial_kv_ratio,
+                self.max_kv_ratio,
             )
             self.expert_gpu_memory_fraction = 1.0 - self.max_kv_ratio
+
+    def validate_runtime(self, vllm_config) -> None:
+        if not self.enabled:
+            return
+        model = vllm_config.model_config
+        parallel = vllm_config.parallel_config
+        if model is None or not model.enforce_eager:
+            raise ValueError("Unified expert cache requires enforce_eager=True")
+        if (
+            any(
+                getattr(parallel, name, 1) != 1
+                for name in (
+                    "tensor_parallel_size",
+                    "pipeline_parallel_size",
+                    "data_parallel_size",
+                    "decode_context_parallel_size",
+                    "prefill_context_parallel_size",
+                )
+            )
+            or parallel.enable_expert_parallel
+            or parallel.enable_eplb
+        ):
+            raise ValueError("Unified expert cache currently supports single GPU only")
+        if model.quantization is not None or vllm_config.lora_config is not None:
+            raise ValueError(
+                "Unified expert cache does not support quantization or LoRA"
+            )
+        if vllm_config.speculative_config is not None or model.enable_sleep_mode:
+            raise ValueError(
+                "Unified expert cache does not support speculation or sleep"
+            )
+        if self.enable_expert_prediction:
+            raise ValueError(
+                "Expert prediction is not integrated with request scheduling"
+            )
+        offload = vllm_config.offload_config
+        if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
+            raise ValueError(
+                "Do not combine unified expert cache with weight offloading"
+            )

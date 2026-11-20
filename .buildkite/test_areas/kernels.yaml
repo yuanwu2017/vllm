@@ -2,6 +2,21 @@ group: Kernels
 depends_on: 
   - image-build
 steps:
+- label: ":nvidia: (H200 MIG 18GB) Unified Expert Cache"
+  key: unified-expert-cache-tests
+  device: h200_18gb
+  timeout_in_minutes: 20
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+    - tests/unified_cache/
+    - vllm/unified_cache/
+    - vllm/config/
+    - vllm/engine/arg_utils.py
+    - vllm/model_executor/layers/fused_moe/
+    - vllm/v1/worker/
+  commands:
+    - pytest -v -s --confcutdir=unified_cache unified_cache
+
 - label: ":nvidia: (H200 MIG 18GB) vLLM IR"
   key: vllm-ir-tests
   automatic_shard: true

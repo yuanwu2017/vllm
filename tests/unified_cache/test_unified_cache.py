@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Unit tests for the unified cache system.
+"""Unit tests for the unified cache system.
 
 Tests the core components: ExpertCacheEngine, ExpertEvictor,
 UnifiedCacheManager, and the MoE integration hooks.
 """
-
-import time
 
 import pytest
 import torch
 
 from vllm.unified_cache.expert_cache_engine import (
     ExpertCacheEngine,
-    ExpertCacheEntry,
     ExpertLocation,
 )
 from vllm.unified_cache.expert_evictor import (
@@ -30,10 +26,10 @@ from vllm.unified_cache.unified_cache_manager import (
     UnifiedCacheManager,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_expert_tensors(
     hidden_size: int = 256,
@@ -63,6 +59,7 @@ def _expert_memory_bytes(hidden_size: int = 256, intermediate_size: int = 512) -
 # ExpertCacheEngine Tests
 # ---------------------------------------------------------------------------
 
+
 class TestExpertCacheEngine:
     """Tests for the ExpertCacheEngine class."""
 
@@ -87,6 +84,24 @@ class TestExpertCacheEngine:
         assert entry.memory_bytes > 0
         assert (0, 0) in engine._gpu_lru
 
+    def test_pre_forward_keeps_cold_experts_on_cpu(self):
+        from vllm.unified_cache.moe_integration import (
+            ExpertCacheRegistry,
+            unified_cache_pre_forward,
+        )
+
+        engine = self._make_engine()
+        engine.register_expert(0, 0, _make_expert_tensors(), on_gpu=False)
+        ExpertCacheRegistry.initialize(engine, enable_cpu_compute=True)
+        try:
+            unified_cache_pre_forward("test.layer", torch.tensor([[0]]))
+
+            assert engine._cache[(0, 0)].location == ExpertLocation.CPU
+            assert engine.stats.total_loads == 0
+            assert engine.stats.cache_misses == 1
+        finally:
+            ExpertCacheRegistry.reset()
+
     def test_register_multiple_experts(self):
         engine = self._make_engine()
         for expert_id in range(10):
@@ -95,6 +110,42 @@ class TestExpertCacheEngine:
 
         assert len(engine._cache) == 10
         assert len(engine._gpu_lru) == 10
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_async_load_waits_before_exposing_weights(self):
+        engine = ExpertCacheEngine(
+            gpu_memory_budget=10 * 1024 * 1024,
+            cpu_memory_budget=10 * 1024 * 1024,
+            device=torch.device("cuda"),
+        )
+        tensors = _make_expert_tensors()
+        engine.register_expert(0, 0, tensors, on_gpu=False)
+
+        event = engine.load_expert(0, 0, sync=False)
+
+        assert event is not None
+        assert engine._cache[(0, 0)].location == ExpertLocation.LOADING
+        assert engine._cache[(0, 0)].transfer_event is event
+        loaded = engine.get_expert(0, 0)
+        assert engine._cache[(0, 0)].location == ExpertLocation.GPU
+        for name, tensor in tensors.items():
+            torch.testing.assert_close(loaded[name].cpu(), tensor)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_eviction_updates_cpu_copy_after_device_work(self):
+        engine = ExpertCacheEngine(
+            gpu_memory_budget=10 * 1024 * 1024,
+            cpu_memory_budget=10 * 1024 * 1024,
+            device=torch.device("cuda"),
+        )
+        tensors = _make_expert_tensors(device="cuda")
+        engine.register_expert(0, 0, tensors, on_gpu=True)
+        for tensor in tensors.values():
+            tensor.fill_(7)
+
+        assert engine.evict_expert(0, 0)
+        for tensor in engine.get_cpu_tensors(0, 0).values():
+            torch.testing.assert_close(tensor, torch.full_like(tensor, 7))
 
     def test_get_expert_hit(self):
         engine = self._make_engine()
@@ -165,7 +216,7 @@ class TestExpertCacheEngine:
 
         assert engine.stats.cache_hits == 2
         assert engine.stats.cache_misses == 1
-        assert abs(engine.hit_rate - 2/3) < 0.01
+        assert abs(engine.hit_rate - 2 / 3) < 0.01
 
     def test_gpu_utilization(self):
         engine = self._make_engine(gpu_budget_mb=10)
@@ -234,33 +285,27 @@ class TestExpertCacheEngine:
 # ExpertEvictor Tests
 # ---------------------------------------------------------------------------
 
-class TestExpertEvictionPolicy:
 
+class TestExpertEvictionPolicy:
     def test_score_expert(self):
-        policy = ExpertEvictionPolicy(
-            hidden_size=256, intermediate_size=512
-        )
+        policy = ExpertEvictionPolicy(hidden_size=256, intermediate_size=512)
 
         # Hot expert should have higher score
-        hot_score = policy.score_expert(
-            ema_access_rate=0.8, memory_bytes=1024 * 1024
-        )
-        cold_score = policy.score_expert(
-            ema_access_rate=0.1, memory_bytes=1024 * 1024
-        )
+        hot_score = policy.score_expert(ema_access_rate=0.8, memory_bytes=1024 * 1024)
+        cold_score = policy.score_expert(ema_access_rate=0.1, memory_bytes=1024 * 1024)
         assert hot_score > cold_score
 
     def test_score_with_time_decay(self):
-        policy = ExpertEvictionPolicy(
-            hidden_size=256, intermediate_size=512
-        )
+        policy = ExpertEvictionPolicy(hidden_size=256, intermediate_size=512)
 
         recent = policy.score_expert(
-            ema_access_rate=0.5, memory_bytes=1024 * 1024,
+            ema_access_rate=0.5,
+            memory_bytes=1024 * 1024,
             time_since_last_access=0.0,
         )
         old = policy.score_expert(
-            ema_access_rate=0.5, memory_bytes=1024 * 1024,
+            ema_access_rate=0.5,
+            memory_bytes=1024 * 1024,
             time_since_last_access=10.0,
         )
         assert recent > old
@@ -269,12 +314,18 @@ class TestExpertEvictionPolicy:
         policy = ExpertEvictionPolicy(hidden_size=256, intermediate_size=512)
 
         high_reuse = policy.score_kv_block(
-            reuse_probability=0.9, seq_len=128,
-            head_dim=64, num_heads=8, memory_bytes=1024,
+            reuse_probability=0.9,
+            seq_len=128,
+            head_dim=64,
+            num_heads=8,
+            memory_bytes=1024,
         )
         low_reuse = policy.score_kv_block(
-            reuse_probability=0.1, seq_len=128,
-            head_dim=64, num_heads=8, memory_bytes=1024,
+            reuse_probability=0.1,
+            seq_len=128,
+            head_dim=64,
+            num_heads=8,
+            memory_bytes=1024,
         )
         assert high_reuse > low_reuse
 
@@ -302,7 +353,6 @@ class TestExpertEvictionPolicy:
 
 
 class TestUnifiedEvictionPolicy:
-
     def test_cross_type_eviction(self):
         expert_policy = ExpertEvictionPolicy(hidden_size=256, intermediate_size=512)
         unified = UnifiedEvictionPolicy(expert_policy)
@@ -327,7 +377,8 @@ class TestUnifiedEvictionPolicy:
         ]
 
         evictions = unified.select_evictions(
-            kv_candidates, expert_candidates,
+            kv_candidates,
+            expert_candidates,
             target_bytes=4096,
         )
         # Lowest score should be evicted first
@@ -343,11 +394,17 @@ class TestUnifiedEvictionPolicy:
 
         kv = EvictionCandidate(
             item_type=CacheItemType.KV_BLOCK,
-            key=(0, 0), score=1.0, memory_bytes=4096, last_access_time=0.0,
+            key=(0, 0),
+            score=1.0,
+            memory_bytes=4096,
+            last_access_time=0.0,
         )
         expert = EvictionCandidate(
             item_type=CacheItemType.EXPERT_WEIGHT,
-            key=(0, 0), score=1.0, memory_bytes=4096, last_access_time=0.0,
+            key=(0, 0),
+            score=1.0,
+            memory_bytes=4096,
+            last_access_time=0.0,
         )
 
         kv_unified = unified.score(kv)
@@ -360,8 +417,8 @@ class TestUnifiedEvictionPolicy:
 # ExpertActivationTracker Tests
 # ---------------------------------------------------------------------------
 
-class TestExpertActivationTracker:
 
+class TestExpertActivationTracker:
     def setup_method(self):
         ExpertActivationTracker.reset_instance()
 
@@ -430,11 +487,9 @@ class TestExpertActivationTracker:
 # UnifiedCacheManager Tests
 # ---------------------------------------------------------------------------
 
-class TestUnifiedCacheManager:
 
-    def _make_manager(
-        self, total_budget_mb: int = 1000, kv_ratio: float = 0.5
-    ):
+class TestUnifiedCacheManager:
+    def _make_manager(self, total_budget_mb: int = 1000, kv_ratio: float = 0.5):
         device = torch.device("cpu")
         expert_budget = int(total_budget_mb * 1024 * 1024 * (1 - kv_ratio))
         cpu_budget = 500 * 1024 * 1024
@@ -506,6 +561,7 @@ class TestUnifiedCacheManager:
 # Integration Smoke Test
 # ---------------------------------------------------------------------------
 
+
 class TestIntegration:
     """Smoke test for the full integration flow."""
 
@@ -575,8 +631,9 @@ class TestIntegration:
 
         # Register some experts
         for expert in range(4):
-            tensors = _make_expert_tensors(hidden_size=64, intermediate_size=128,
-                                           device="cpu")
+            tensors = _make_expert_tensors(
+                hidden_size=64, intermediate_size=128, device="cpu"
+            )
             expert_cache.register_expert(0, expert, tensors, on_gpu=True)
 
         stats = manager.get_stats()

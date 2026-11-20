@@ -66,6 +66,7 @@ from vllm.config import (
     SchedulerConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
+    UnifiedCacheConfig,
     UVAOffloadConfig,
     VllmConfig,
     WatchdogConfig,
@@ -766,6 +767,7 @@ class EngineArgs:
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
+    unified_cache_config: UnifiedCacheConfig | None = None
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
     engram_config: EngramConfig | None = VllmConfig.engram_config
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
@@ -883,6 +885,8 @@ class EngineArgs:
         # CompilationConfig object
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
+        if isinstance(self.unified_cache_config, dict):
+            self.unified_cache_config = UnifiedCacheConfig(**self.unified_cache_config)
         if isinstance(self.attention_config, dict):
             self.attention_config = AttentionConfig(**self.attention_config)
         if isinstance(self.aux_output_config, dict):
@@ -1919,6 +1923,9 @@ class EngineArgs:
             "--compilation-config", "-cc", **vllm_kwargs["compilation_config"]
         )
         vllm_group.add_argument(
+            "--unified-cache-config", **vllm_kwargs["unified_cache_config"]
+        )
+        vllm_group.add_argument(
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
         vllm_group.add_argument("--engram-config", **vllm_kwargs["engram_config"])
@@ -2949,6 +2956,7 @@ class EngineArgs:
             observability_config=observability_config,
             logging_config=logging_config,
             compilation_config=compilation_config,
+            unified_cache_config=self.unified_cache_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,

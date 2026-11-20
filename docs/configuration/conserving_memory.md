@@ -75,6 +75,53 @@ from vllm import LLM
 llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", enforce_eager=True)
 ```
 
+## Experimental MoE CPU Expert Offloading
+
+This branch provides an experimental `unified_cache_config` option, disabled by
+default. It keeps a bounded set of expert weights on GPU and the full expert
+weights on CPU. Enable CPU computation for non-resident experts with:
+
+```bash
+vllm serve /path/to/moe-model \
+    --enforce-eager \
+    --kernel-config '{"moe_backend":"triton"}' \
+    --unified-cache-config '{"enabled":true,"enable_cpu_compute":true,"expert_gpu_memory_fraction":0.3,"expert_cpu_memory_gb":50}'
+```
+
+The Python `LLM` API accepts the same dictionaries through `kernel_config` and
+`unified_cache_config`. The GPU fraction is relative to the loaded expert weight
+bytes. CPU capacity must fit **all** expert weights, not just the cold subset.
+With `enable_cpu_compute=false`, missing experts are loaded to GPU for computation.
+
+This is a correctness-first eager implementation, not a throughput optimization.
+It currently supports one CUDA GPU, unquantized Triton gated SiLU/GELU experts
+without bias. Quantization, parallel execution, LoRA, speculative decoding, sleep
+mode, and simultaneous weight offload backends are unsupported. All weights must
+initially fit on GPU during loading. Experts are offloaded after loading, before
+KV cache profiling. The runtime does not dynamically resize allocated KV blocks;
+prefix-based expert prediction is not connected to request scheduling.
+
+CUDA regression tests, including local randomly initialized Mixtral weights run
+through `LLM`, are in `tests/unified_cache`. Run them in a source installation with
+matching compiled extensions:
+
+```bash
+VLLM_PLUGINS='' .venv/bin/python -m pytest \
+    --confcutdir=tests/unified_cache tests/unified_cache -q
+```
+
+The FP32 model comparison explicitly uses IEEE Triton dot products rather than
+TF32. Passing this test does not establish production-model accuracy or speedups.
+
+Larger synthetic BF16 batch tests have produced different greedy sequences from
+the fused GPU path, while the corresponding IEEE FP32 tests matched. Validate
+model quality before using lower-precision CPU expert execution. Reduced live
+tensor allocations do not necessarily reduce allocator-reserved or process GPU
+memory: the initial full-model load and temporary buffers can retain memory.
+Neither greater serving capacity nor a speedup over fully resident GPU experts
+has been established. CPU execution can avoid repeated weight transfers, but its
+benefit over GPU weight swapping depends on dtype, batch size, and host load.
+
 ## Sparse indexer decode logits
 
 On SM100, the sparse indexer computes decode logits in chunks of query rows whose

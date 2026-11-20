@@ -682,31 +682,24 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            from vllm.unified_cache.moe_integration import (
-                unified_cache_pre_forward,
-                unified_cache_split_compute,
-            )
+            from vllm.unified_cache.moe_integration import unified_cache_forward
 
-            unified_cache_pre_forward(self.layer_name, topk_ids)
-            cpu_contribution, gpu_topk_weights, split_active = (
-                unified_cache_split_compute(
-                    self.layer_name, hidden_states, topk_weights, topk_ids,
+            fused_out = unified_cache_forward(
+                self.routed_experts.layer_name,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.activation.value,
+                self.routed_experts.apply_router_weight_on_input,
+            )
+            if fused_out is None:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
                 )
-            )
-
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=gpu_topk_weights if split_active else topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
-            if split_active and cpu_contribution is not None:
-                if not isinstance(fused_out, torch.Tensor):
-                    raise NotImplementedError(
-                        "CPU expert compute requires finalized MoE output"
-                    )
-                fused_out = fused_out + cpu_contribution
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None

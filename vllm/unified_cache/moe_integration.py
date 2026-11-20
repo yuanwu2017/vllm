@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-MoE layer integration for the unified cache system.
+"""MoE layer integration for the unified cache system.
 
 This module provides hooks and utilities to integrate the ExpertCacheEngine
 with vLLM's FusedMoE layer. It modifies the MoE forward pass to:
@@ -18,7 +17,8 @@ Integration approach:
   unified_cache_config.enabled is True
 """
 
-from typing import Optional, Sequence
+from collections.abc import Sequence
+from typing import Optional
 
 import torch
 
@@ -32,8 +32,7 @@ logger = init_logger(__name__)
 
 
 class ExpertCacheRegistry:
-    """
-    Global registry that connects MoE layers to the expert cache engine.
+    """Global registry that connects MoE layers to the expert cache engine.
 
     Singleton pattern — populated during engine init, queried during forward.
     """
@@ -56,8 +55,12 @@ class ExpertCacheRegistry:
         prediction_confidence: float = 0.1,
     ) -> "ExpertCacheRegistry":
         instance = cls(
-            expert_cache_engine, enable_tracking, enable_cpu_compute,
-            enable_prediction, dag_decay, dag_max_nodes,
+            expert_cache_engine,
+            enable_tracking,
+            enable_cpu_compute,
+            enable_prediction,
+            dag_decay,
+            dag_max_nodes,
             prediction_confidence,
         )
         cls._instance = instance
@@ -85,11 +88,13 @@ class ExpertCacheRegistry:
         # Map from layer_name (prefix) to layer_id for tracking
         self._layer_name_to_id: dict[str, int] = {}
         self._next_layer_id = 0
+        self.offloaded_layers: set[str] = set()
+        self._current_block_hashes: list[int] | None = None
 
         # Phase 3+4: Prefix-aware expert prediction
         self.prediction_enabled = enable_prediction
-        self.dag: Optional[PrefixExpertDAG] = None
-        self.predictor: Optional[ExpertPredictor] = None
+        self.dag: PrefixExpertDAG | None = None
+        self.predictor: ExpertPredictor | None = None
         if enable_prediction:
             self.dag = PrefixExpertDAG(
                 decay_factor=dag_decay,
@@ -103,7 +108,9 @@ class ExpertCacheRegistry:
             logger.info(
                 "Expert prediction enabled: dag_decay=%.3f, "
                 "max_nodes=%d, confidence=%.2f",
-                dag_decay, dag_max_nodes, prediction_confidence,
+                dag_decay,
+                dag_max_nodes,
+                prediction_confidence,
             )
 
     def get_layer_id(self, layer_name: str) -> int:
@@ -118,8 +125,7 @@ def unified_cache_pre_forward(
     layer_name: str,
     topk_ids: torch.Tensor,
 ) -> None:
-    """
-    Hook called in FusedMoE forward AFTER router selection, BEFORE expert compute.
+    """Hook called in FusedMoE forward AFTER router selection, BEFORE expert compute.
 
     This function:
     1. Records which experts were selected (for tracking)
@@ -127,8 +133,9 @@ def unified_cache_pre_forward(
     3. Prefetches experts that are likely needed soon
 
     Args:
-        layer_name: The FusedMoE layer's prefix name (e.g., "model.layers.0.mlp.experts").
+        layer_name: The FusedMoE layer's prefix name.
         topk_ids: Tensor of shape (num_tokens, top_k) with selected expert indices.
+
     """
     registry = ExpertCacheRegistry.get_instance()
     if registry is None:
@@ -144,7 +151,7 @@ def unified_cache_pre_forward(
     if registry.prediction_enabled and registry.predictor is not None:
         expert_ids = topk_ids.detach().cpu().flatten().tolist()
         # Use _current_block_hashes if set by predict_for_request()
-        block_hashes = getattr(registry, '_current_block_hashes', None)
+        block_hashes = getattr(registry, "_current_block_hashes", None)
         if block_hashes:
             registry.predictor.record_feedback(
                 block_hashes=block_hashes,
@@ -160,12 +167,18 @@ def unified_cache_pre_forward(
     # Check which experts need loading
     experts_to_load = []
     for expert_id in unique_experts:
+        if expert_id == -1:
+            continue
         tensors = registry.cache_engine.get_expert(layer_id, int(expert_id))
         if tensors is None:
             experts_to_load.append(int(expert_id))
 
     # Load missing experts (sync for correctness)
-    if experts_to_load:
+    if (
+        experts_to_load
+        and not registry.cpu_compute_enabled
+        and layer_name not in registry.offloaded_layers
+    ):
         events = registry.cache_engine.prefetch_experts(
             layer_id=layer_id,
             expert_ids=experts_to_load,
@@ -178,8 +191,7 @@ def unified_cache_pre_forward(
 def predict_experts_for_request(
     block_hashes: Sequence[int],
 ) -> dict[int, list[int]]:
-    """
-    Predict and prefetch experts for an incoming request (Phase 4).
+    """Predict and prefetch experts for an incoming request (Phase 4).
 
     Should be called at request scheduling time, before any MoE layers run.
     This sets the current block hashes on the registry so that subsequent
@@ -190,6 +202,7 @@ def predict_experts_for_request(
 
     Returns:
         Dict of layer_id -> list of prefetched expert_ids.
+
     """
     registry = ExpertCacheRegistry.get_instance()
     if registry is None or not registry.prediction_enabled:
@@ -210,13 +223,103 @@ def clear_request_context() -> None:
         registry._current_block_hashes = None
 
 
+def offload_experts_from_layer(layer: torch.nn.Module) -> None:
+    """Move packed parameters to CPU and give the cache independent GPU copies."""
+    registry = ExpertCacheRegistry.get_instance()
+    if registry is None:
+        raise RuntimeError("Expert cache must be initialized before offloading")
+    if layer.layer_name in registry.offloaded_layers:
+        raise ValueError(f"Layer {layer.layer_name} is already offloaded")
+    cache = registry.cache_engine
+    names = ("w13_weight", "w2_weight")
+    memory_bytes = sum(
+        getattr(layer, name).numel() * getattr(layer, name).element_size()
+        for name in names
+    )
+    if cache.cpu_memory_used + memory_bytes > cache.cpu_memory_budget:
+        raise ValueError("Expert CPU memory budget is too small for model weights")
+    for name in names:
+        weights = getattr(layer, name).detach().to("cpu")
+        if cache.pin_cpu_memory and not weights.is_pinned():
+            weights = weights.pin_memory()
+        setattr(layer, name, torch.nn.Parameter(weights, requires_grad=False))
+    layer_id = registry.get_layer_id(layer.layer_name)
+    for expert_id in range(layer.w13_weight.shape[0]):
+        cache.register_expert(
+            layer_id,
+            expert_id,
+            {name: getattr(layer, name)[expert_id].detach() for name in names},
+            on_gpu=False,
+        )
+        entry = cache._cache[(layer_id, expert_id)]
+        if cache.gpu_memory_used + entry.memory_bytes <= cache.gpu_memory_budget:
+            cache.load_expert(layer_id, expert_id, sync=True)
+    registry.offloaded_layers.add(layer.layer_name)
+
+
+def unified_cache_forward(
+    layer_name: str,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor | None:
+    """Reference eager execution using only cache-owned expert weights."""
+    registry = ExpertCacheRegistry.get_instance()
+    if registry is None or layer_name not in registry.offloaded_layers:
+        return None
+    from vllm.unified_cache.cpu_expert_compute import cpu_expert_ffn
+
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Expert CPU offloading requires eager execution")
+    unified_cache_pre_forward(layer_name, topk_ids)
+    cache = registry.cache_engine
+    layer_id = registry.get_layer_id(layer_name)
+    output = torch.zeros_like(hidden_states)
+    routing_ids = topk_ids.cpu()
+    for expert_id in routing_ids.unique().tolist():
+        if expert_id == -1:
+            continue
+        if (layer_id, expert_id) not in cache._cache:
+            raise RuntimeError(f"Unregistered expert {expert_id} in {layer_name}")
+        weights = cache.get_expert(layer_id, expert_id)
+        on_cpu = weights is None and registry.cpu_compute_enabled
+        if weights is None and not on_cpu:
+            cache.load_expert(layer_id, expert_id, sync=True)
+            weights = cache.get_expert(layer_id, expert_id)
+            if weights is None:
+                raise RuntimeError("Expert GPU budget cannot fit one expert")
+        if on_cpu:
+            weights = cache.get_cpu_tensors(layer_id, expert_id)
+        if weights is None:
+            raise RuntimeError(f"Expert {expert_id} in {layer_name} has no weights")
+        token_ids, slot_ids = (routing_ids == expert_id).nonzero(as_tuple=True)
+        token_ids = token_ids.to(hidden_states.device)
+        slot_ids = slot_ids.to(hidden_states.device)
+        inputs = hidden_states[token_ids]
+        router_weights = topk_weights[token_ids, slot_ids].unsqueeze(-1)
+        if apply_router_weight_on_input:
+            inputs = (inputs * router_weights).to(hidden_states.dtype)
+        expert_output = cpu_expert_ffn(
+            inputs.to("cpu") if on_cpu else inputs,
+            weights["w13_weight"],
+            weights["w2_weight"],
+            activation,
+        ).to(hidden_states.device)
+        if not apply_router_weight_on_input:
+            expert_output = expert_output * router_weights
+        output.index_add_(0, token_ids, expert_output.to(output.dtype))
+        del weights, expert_output
+    return output
+
+
 def unified_cache_get_expert_weights(
     layer_name: str,
     expert_id: int,
     weight_name: str,
-) -> Optional[torch.Tensor]:
-    """
-    Get a specific expert weight tensor from the cache.
+) -> torch.Tensor | None:
+    """Get a specific expert weight tensor from the cache.
 
     Called during MoE computation when the layer needs expert weights.
     Returns the GPU tensor if cached, None otherwise.
@@ -228,6 +331,7 @@ def unified_cache_get_expert_weights(
 
     Returns:
         The weight tensor on GPU, or None if not available.
+
     """
     registry = ExpertCacheRegistry.get_instance()
     if registry is None:
@@ -244,10 +348,9 @@ def register_experts_from_layer(
     layer_name: str,
     num_experts: int,
     weight_dict: dict[int, dict[str, torch.Tensor]],
-    initial_gpu_experts: Optional[set[int]] = None,
+    initial_gpu_experts: set[int] | None = None,
 ) -> None:
-    """
-    Register all experts from a FusedMoE layer with the cache engine.
+    """Register all experts from a FusedMoE layer with the cache engine.
 
     Called during model initialization after weights are loaded.
 
@@ -257,6 +360,7 @@ def register_experts_from_layer(
         weight_dict: Mapping of expert_id -> {weight_name: tensor}.
         initial_gpu_experts: Set of expert IDs to keep on GPU initially.
             If None, all experts start on GPU (default vLLM behavior).
+
     """
     registry = ExpertCacheRegistry.get_instance()
     if registry is None:
@@ -277,8 +381,7 @@ def register_experts_from_layer(
         )
 
     logger.info(
-        "Registered %d experts for layer %s (layer_id=%d), "
-        "%d initially on GPU",
+        "Registered %d experts for layer %s (layer_id=%d), %d initially on GPU",
         len(weight_dict),
         layer_name,
         layer_id,
@@ -297,9 +400,8 @@ def unified_cache_split_compute(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], bool]:
-    """
-    Decide whether to split MoE computation between GPU and CPU.
+) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
+    """Decide whether to split MoE computation between GPU and CPU.
 
     If all selected experts are on GPU, returns (None, None, False) — the
     caller should use the fast fused kernel as usual.
@@ -326,13 +428,14 @@ def unified_cache_split_compute(
 
     Returns:
         Tuple of (cpu_contribution, gpu_topk_weights, split_active).
+
     """
     registry = ExpertCacheRegistry.get_instance()
     if registry is None:
         return None, None, False
 
     # Check if CPU active compute is enabled
-    if not getattr(registry, 'cpu_compute_enabled', False):
+    if not getattr(registry, "cpu_compute_enabled", False):
         return None, None, False
 
     layer_id = registry.get_layer_id(layer_name)
@@ -393,7 +496,9 @@ def unified_cache_split_compute(
 
     logger.debug(
         "Split compute for layer %s: %d GPU experts, %d CPU experts",
-        layer_name, len(gpu_expert_set), len(cpu_expert_set),
+        layer_name,
+        len(gpu_expert_set),
+        len(cpu_expert_set),
     )
 
     return cpu_contribution, gpu_topk_weights, True

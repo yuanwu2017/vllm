@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Engine-level initialization for the unified cache system.
+"""Engine-level initialization for the unified cache system.
 
 This module handles setting up the ExpertCacheEngine, UnifiedCacheManager,
 and ExpertCacheRegistry during vLLM engine startup. It reads the
@@ -12,24 +11,25 @@ Usage (called from vLLM engine init):
     manager = maybe_init_unified_cache(vllm_config, device)
 """
 
-from typing import Optional
-
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.unified_cache.expert_cache_engine import ExpertCacheEngine
 from vllm.unified_cache.expert_tracker import ExpertActivationTracker
-from vllm.unified_cache.moe_integration import ExpertCacheRegistry
+from vllm.unified_cache.moe_integration import (
+    ExpertCacheRegistry,
+    offload_experts_from_layer,
+)
 from vllm.unified_cache.unified_cache_manager import UnifiedCacheManager
 
 logger = init_logger(__name__)
 
 # Global reference for engine-level access
-_unified_cache_manager: Optional[UnifiedCacheManager] = None
+_unified_cache_manager: UnifiedCacheManager | None = None
 
 
-def get_unified_cache_manager() -> Optional[UnifiedCacheManager]:
+def get_unified_cache_manager() -> UnifiedCacheManager | None:
     """Get the global UnifiedCacheManager instance, if initialized."""
     return _unified_cache_manager
 
@@ -41,9 +41,8 @@ def maybe_init_unified_cache(
     num_experts: int = 0,
     hidden_size: int = 0,
     intermediate_size: int = 0,
-) -> Optional[UnifiedCacheManager]:
-    """
-    Initialize the unified cache system if enabled in config.
+) -> UnifiedCacheManager | None:
+    """Initialize the unified cache system if enabled in config.
 
     Called during vLLM engine startup after GPU memory profiling.
 
@@ -59,6 +58,7 @@ def maybe_init_unified_cache(
 
     Returns:
         UnifiedCacheManager if unified cache is enabled, None otherwise.
+
     """
     global _unified_cache_manager
 
@@ -126,11 +126,74 @@ def maybe_init_unified_cache(
 
     _unified_cache_manager = manager
 
-    logger.info(
-        "Unified cache system initialized: %s", manager
-    )
+    logger.info("Unified cache system initialized: %s", manager)
 
     return manager
+
+
+def initialize_model_expert_cache(
+    vllm_config: VllmConfig,
+    model: torch.nn.Module,
+    device: torch.device,
+) -> int:
+    """Offload supported loaded experts and return the released GPU bytes."""
+    config = vllm_config.unified_cache_config
+    if config is None or not config.enabled:
+        return 0
+    config.validate_runtime(vllm_config)
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        UnquantizedMoeBackend,
+    )
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    layers = [layer for layer in model.modules() if isinstance(layer, RoutedExperts)]
+    if not layers:
+        raise ValueError("Unified expert cache requires a model with RoutedExperts")
+    total_bytes = 0
+    largest_expert_bytes = 0
+    for layer in layers:
+        method = layer.quant_method
+        if (
+            not isinstance(method, UnquantizedFusedMoEMethod)
+            or method.unquantized_backend != UnquantizedMoeBackend.TRITON
+            or layer.activation.value not in ("silu", "gelu")
+            or layer.moe_config.has_bias
+        ):
+            raise ValueError(
+                "Unified expert cache requires unquantized Triton gated SiLU/GELU "
+                "experts without bias; set kernel_config.moe_backend='triton'"
+            )
+        layer_bytes = sum(
+            weight.numel() * weight.element_size()
+            for weight in (layer.w13_weight, layer.w2_weight)
+        )
+        total_bytes += layer_bytes
+        largest_expert_bytes = max(
+            largest_expert_bytes, layer_bytes // layer.w13_weight.shape[0]
+        )
+    if total_bytes > int(config.expert_cpu_memory_gb * 1024**3):
+        raise ValueError("Expert CPU memory budget is too small for model weights")
+    if (
+        not config.enable_cpu_compute
+        and int(total_bytes * config.expert_gpu_memory_fraction) < largest_expert_bytes
+    ):
+        raise ValueError("Expert GPU budget must fit at least one expert")
+    torch.accelerator.synchronize(device)
+    before = torch.accelerator.memory_allocated(device)
+    maybe_init_unified_cache(vllm_config, device, total_bytes)
+    for layer in layers:
+        offload_experts_from_layer(layer)
+    torch.accelerator.synchronize(device)
+    released = before - torch.accelerator.memory_allocated(device)
+    logger.info(
+        "Offloaded %d MoE layers; released %.3f GiB of GPU allocations",
+        len(layers),
+        released / 1024**3,
+    )
+    return released
 
 
 def shutdown_unified_cache() -> None:

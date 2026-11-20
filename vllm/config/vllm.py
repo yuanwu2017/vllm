@@ -1584,6 +1584,9 @@ class VllmConfig:
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
+        if self.unified_cache_config is not None:
+            self.unified_cache_config.validate_runtime(self)
+
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
